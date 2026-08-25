@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -358,3 +360,167 @@ async def test_compat_replanner_passes_shared_profile(tmp_path: Path) -> None:
     kwargs = mock_router.harness.await_args.kwargs
     assert kwargs["profile"] == ProfileId("swe_af.main.replanner")
     assert kwargs["provider"] == "opencode"
+
+
+@pytest.mark.asyncio
+async def test_external_profile_source_reaches_opencode_from_sweaf_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise a real SWE-AF role through AgentField and a file-backed profile."""
+    from agentfield import HarnessConfig
+
+    import swe_af.app as app_module
+    from swe_af.prompts.product_manager import SYSTEM_PROMPT
+    from swe_af.reasoners import pipeline
+
+    profile_path = tmp_path / "opencode-profiles.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "contract_version": "v1",
+                "provider": "opencode",
+                "minimum_version": "1.18.0",
+                "profiles": {
+                    "swe_af.main.pm": {
+                        "mode": "primary",
+                        "model": "openrouter/external-profile#profile-default",
+                        "prompt": "External AgentField PM profile instructions.",
+                        "permission": {
+                            "read": "allow",
+                            "edit": "allow",
+                            "bash": "allow",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_opencode = tmp_path / "fake-opencode"
+    fake_opencode.write_text(
+        "#!" + sys.executable + "\n"
+        + r'''
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def _record(record: dict[str, object]) -> None:
+    log_path = os.environ.get("FAKE_OPENCODE_LOG")
+    if not log_path:
+        return
+    with Path(log_path).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if argv == ["--version"]:
+        print("opencode 1.18.0")
+        return 0
+    if argv == ["run", "--help"]:
+        print("--agent --format --dir --model --variant")
+        return 0
+    if not argv or argv[0] != "run":
+        return 2
+
+    config = json.loads(Path(os.environ["OPENCODE_CONFIG"]).read_text())
+    agent_id = argv[argv.index("--agent") + 1]
+    selected = config["agent"][agent_id]
+    if config["default_agent"] != agent_id or selected["mode"] != "primary":
+        return 3
+    if selected["prompt"] != "External AgentField PM profile instructions.":
+        return 4
+
+    _record({"argv": argv, "config": config, "prompt": argv[-1]})
+    result = {
+        "validated_description": "external profile fixture",
+        "acceptance_criteria": ["the profile is selected"],
+        "must_have": ["the role prompt is preserved"],
+        "nice_to_have": [],
+        "out_of_scope": [],
+    }
+    print(json.dumps({"type": "text", "part": {"text": json.dumps(result)}}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+''',
+        encoding="utf-8",
+    )
+    fake_opencode.chmod(0o755)
+
+    log_path = tmp_path / "opencode.jsonl"
+    monkeypatch.setenv("AGENTFIELD_OPENCODE_PROFILE_FILE", str(profile_path))
+    monkeypatch.setenv("FAKE_OPENCODE_LOG", str(log_path))
+
+    harness_config = HarnessConfig(
+        provider="opencode",
+        opencode_bin=str(fake_opencode),
+    )
+    monkeypatch.setattr(app_module.app, "harness_config", harness_config)
+    monkeypatch.setattr(app_module.app, "_harness_runner", None)
+
+    observed_harness_calls: list[dict[str, object]] = []
+
+    async def traced_harness(prompt: str, **kwargs: object):
+        observed_harness_calls.append(dict(kwargs))
+        return await app_module.app.harness(prompt, **kwargs)
+
+    # Use a fresh role-facing proxy rather than relying on whichever router a
+    # preceding module-isolation test left attached to the process-wide app.
+    role_router = SimpleNamespace(
+        harness=traced_harness,
+        note=MagicMock(),
+        agentfield_server="http://localhost:9999",
+    )
+    monkeypatch.setattr(pipeline, "router", role_router)
+
+    real_product_manager = getattr(
+        pipeline.run_product_manager,
+        "_original_func",
+        pipeline.run_product_manager,
+    )
+    with (
+        patch("swe_af.hitl.build_hax_client_from_env", return_value=None),
+        patch("swe_af.hitl.approval_webhook_url", return_value=None),
+    ):
+        result = await real_product_manager(
+            goal="Exercise the external profile path",
+            repo_path=str(tmp_path),
+            model="openrouter/role-model#role-variant",
+            max_turns=2,
+            permission_mode="auto",
+            ai_provider="open_code",
+        )
+
+    assert result["validated_description"] == "external profile fixture"
+    assert observed_harness_calls
+    assert observed_harness_calls[0]["profile"] == ProfileId("swe_af.main.pm")
+    assert observed_harness_calls[0]["system_prompt"] == SYSTEM_PROMPT
+
+    records = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    run_record = next(record for record in records if record["argv"][0] == "run")
+    argv = run_record["argv"]
+    assert argv[argv.index("--agent") + 1] == "swe_af.main.pm"
+    assert argv[argv.index("-m") + 1] == "openrouter/role-model"
+    assert argv[argv.index("--variant") + 1] == "role-variant"
+    assert run_record["config"]["agent"]["swe_af.main.pm"]["prompt"] == (
+        "External AgentField PM profile instructions."
+    )
+
+    effective_prompt = run_record["prompt"]
+    assert effective_prompt.startswith("SYSTEM INSTRUCTIONS:\n" + SYSTEM_PROMPT)
+    assert "\n---\n\nUSER REQUEST:\n" in effective_prompt
+    assert "## Goal\nExercise the external profile path" in effective_prompt
+    assert "External AgentField PM profile instructions." not in effective_prompt

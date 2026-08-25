@@ -81,6 +81,69 @@ than to an upstream release that lacks the profile contract. The registry in
 JSON, generated configuration paths, permissions, credentials, or model
 defaults there. AgentField owns those provider concerns.
 
+## OpenCode profile configuration
+
+SWE-AF sends an opaque role `ProfileId` at each direct harness boundary. The
+external AgentField profile source must use that exact ID as its `profiles` key;
+AgentField then maps the ID to the concrete OpenCode agent definition. For
+example, a deployment can point `AGENTFIELD_OPENCODE_PROFILE_FILE` at
+`/etc/agentfield/opencode-profiles.json`:
+
+```bash
+export AGENTFIELD_OPENCODE_PROFILE_FILE=/etc/agentfield/opencode-profiles.json
+```
+
+The file is provider-owned configuration, not a SWE-AF registry. A compact
+example with three role mappings is:
+
+```json
+{
+  "profiles": {
+    "swe_af.main.pm": {
+      "mode": "primary",
+      "model": "openrouter/example/pm#high",
+      "prompt": "Use the external PM operating policy.",
+      "permission": {
+        "read": "allow",
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "swe_af.main.coder": {
+      "mode": "primary",
+      "model": "openrouter/example/coder#high",
+      "prompt": "Use the external coder operating policy."
+    },
+    "swe_af.main.code_reviewer": {
+      "mode": "primary",
+      "model": "openrouter/example/reviewer#high",
+      "prompt": "Use the external reviewer operating policy."
+    }
+  }
+}
+```
+
+The mapping is exact: `ProfileId("swe_af.main.pm")` selects
+`profiles["swe_af.main.pm"]`, and the AgentField OpenCode adapter invokes
+`opencode run --agent swe_af.main.pm` with that materialized definition.
+Every profile-managed direct role and any profile-managed alias used by a
+deployment needs a corresponding exact entry. An unknown or fallback-selected
+entry is rejected rather than silently using another profile. The same source
+can be supplied through AgentField's `HarnessConfig(opencode_profile_file=...)`
+or the `AGENTFIELD_OPENCODE_PROFILES` JSON environment variable.
+
+The `prompt` in this file is the provider-owned OpenCode profile prompt. It is
+not the SWE-AF role system prompt. SWE-AF continues to pass each role's existing
+system prompt separately through AgentField's `system_prompt` harness input;
+AgentField applies that role input while selecting the external profile and
+does not require copying role prompt text into this file or the SWE-AF registry.
+SWE-AF model and `#variant` values also remain call inputs and take precedence
+over profile defaults when supplied.
+
+The supported profile capability line begins with OpenCode `1.18.x` fixtures.
+AgentField probes the executable's `run` surface before launch; use `1.18.x` or
+a later supported 1.x release only after its capability fixture passes.
+
 ## Quick Start
 
 ### Full Stack (control plane + agent)
@@ -93,6 +156,7 @@ docker compose up -d
 ```
 
 This starts:
+
 - **control-plane** on `:8080` — AgentField orchestration server
 - **swe-agent** on `:8003` — SWE-AF full pipeline (`swe-planner` node)
 - **swe-fast** on `:8004` — SWE-AF fast mode (`swe-fast` node)
@@ -127,13 +191,15 @@ curl http://localhost:8080/api/v1/health
 ### `/workspaces` read-only filesystem error
 
 **Symptom:**
-```
+
+```text
 [Errno 30] Read-only file system: '/workspaces'
 ```
 
 **Root cause:** The `/workspaces` directory was not pre-created in the Docker image. When Docker mounts a named volume, it creates the directory as root with restrictive permissions.
 
 **Fix:** This is fixed in the current Dockerfile. If you're using an older image, rebuild:
+
 ```bash
 docker compose build --no-cache
 ```
@@ -169,6 +235,7 @@ python -m pip install -e .
 **Root cause:** Non-retryable API errors (credit exhaustion, invalid key) were not distinguished from transient errors, causing all retry layers to fire.
 
 **Fix:** This is fixed in the current version. Upgrade to get `FatalHarnessError` detection that immediately aborts on:
+
 - Credit balance too low
 - Invalid API key
 - Authentication failed
@@ -201,6 +268,7 @@ docker compose up --scale swe-agent=3 -d
 ### Resource considerations
 
 Each build clones the target repository and runs multiple LLM calls. Plan for:
+
 - **Disk:** ~500MB per concurrent build (repo clone + artifacts)
 - **Memory:** ~512MB per agent container
 - **Network:** LLM API calls are the bottleneck, not compute
