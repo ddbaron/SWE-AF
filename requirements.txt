@@ -2,7 +2,9 @@
 #
 # Install: python -m pip install -r requirements.txt
 
-agentfield>=0.1.113
+# Profile propagation and the isolated OpenCode provider from the maintained
+# AgentField fork; keep this commit aligned with pyproject.toml.
+agentfield @ git+https://github.com/ddbaron/agentfield.git@aa0304577017ee25c405db2a7c2b5fd666f7decc#subdirectory=sdk/python
 pydantic>=2.0
 claude-agent-sdk==0.1.20
 hax-sdk>=0.2.4

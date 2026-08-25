@@ -17,6 +17,9 @@ author: Agent-Field
 # `python -m swe_af` and the Docker images run. The redirect is a git-install
 # behaviour only: to install this node deliberately, clone the repo and install
 # the checkout as a local path.
+# Profile-managed OpenCode deployments consume the maintained AgentField Python
+# fork at aa0304577017ee25c405db2a7c2b5fd666f7decc; see the dependency pins and
+# deployment guide for the fixture-gated OpenCode 1.18.x capability line.
 superseded_by: https://github.com/Agent-Field/SWE-AF//go
 
 entrypoint:

@@ -69,10 +69,17 @@ The image registers `MiniMax-M3` and `MiniMax-M2.7` under the direct OpenAI-comp
 
 | Package | Minimum Version | Notes |
 |---|---|---|
-| `agentfield` | 0.1.67+ | Python SDK (includes opencode v1.4+ fix) |
+| `agentfield` | `ddbaron/agentfield@aa0304577017ee25c405db2a7c2b5fd666f7decc` | Maintained fork commit providing the typed `profile` harness field and isolated OpenCode profile provider |
 | `claude-agent-sdk` | 0.1.20+ | Claude runtime |
-| opencode CLI | 1.4+ | Only if using `open_code` runtime (see Known Issues) |
+| opencode CLI | 1.18.x fixtures and later supported 1.x lines | Profile-managed `open_code` runtime; each newer minor requires a passing capability fixture |
 | Codex CLI | latest | Installed in the Docker image; required on host only to run `codex login` for ChatGPT subscription auth |
+
+The Python dependency is pinned to the maintained AgentField fork commit above
+in `pyproject.toml`, `requirements.txt`, and `requirements-docker.txt` rather
+than to an upstream release that lacks the profile contract. The registry in
+`swe_af/runtime/profiles.py` contains role identity only; do not add OpenCode
+JSON, generated configuration paths, permissions, credentials, or model
+defaults there. AgentField owns those provider concerns.
 
 ## Quick Start
 
@@ -139,13 +146,18 @@ The fix adds `RUN mkdir -p /workspaces && chmod 777 /workspaces` to the Dockerfi
 
 **Symptom:** Builds using the `open_code` runtime fail at the Product Manager step with a generic error. The agent completes in a few seconds (too fast for real work).
 
-**Root cause:** opencode CLI v1.4+ changed its CLI interface:
+**Root cause:** opencode CLI changed its CLI interface before the supported
+profile-managed capability line:
+
 - `-p` (prompt) flag was removed — prompt is now a positional arg to the `run` subcommand
 - `-c` now means `--continue` (resume session), not project directory
 
-**Fix:** Upgrade the `agentfield` Python SDK to a version that includes the opencode v1.4+ compatibility fix:
+**Fix:** Use the pinned AgentField fork commit from the Package Versions table
+and a capability-fixture-supported OpenCode `1.18.x` (or later supported 1.x)
+release:
+
 ```bash
-pip install --upgrade agentfield
+python -m pip install -e .
 ```
 
 **Ref:** [#45](https://github.com/Agent-Field/SWE-AF/issues/45)

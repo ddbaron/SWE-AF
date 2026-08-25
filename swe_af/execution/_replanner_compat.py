@@ -15,6 +15,7 @@ from swe_af.execution.schemas import (
 )
 from swe_af.prompts.replanner import SYSTEM_PROMPT, replanner_task_prompt
 from swe_af.reasoners import router
+from swe_af.runtime.profiles import profile_for
 from swe_af.runtime.providers import runtime_to_harness_adapter
 
 
@@ -47,6 +48,7 @@ async def invoke_replanner(
             prompt=task_prompt,
             schema=ReplanDecision,
             provider=provider,
+            profile=profile_for("swe_af.compat.replanner", config.ai_provider),
             model=config.replan_model,
             max_turns=DEFAULT_AGENT_MAX_TURNS,
             tools=["Read", "Write", "Glob", "Grep", "Bash"],

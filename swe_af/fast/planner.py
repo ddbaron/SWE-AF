@@ -12,6 +12,7 @@ import logging
 from swe_af.fast import fast_router
 from swe_af.fast.prompts import FAST_PLANNER_SYSTEM_PROMPT, fast_planner_task_prompt
 from swe_af.fast.schemas import FastPlanResult, FastTask
+from swe_af.runtime.profiles import profile_for
 from swe_af.runtime.providers import runtime_to_harness_adapter
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ async def fast_plan_tasks(
             prompt=task_prompt,
             schema=FastPlanResult,
             provider=provider,
+            profile=profile_for("swe_af.fast.plan_tasks", ai_provider),
             model=pm_model,
             max_turns=3,
             permission_mode=permission_mode or None,

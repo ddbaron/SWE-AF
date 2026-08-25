@@ -18,6 +18,7 @@ flowchart LR
 - [Build Pipeline](#build-pipeline)
 - [Planning → Issue DAG](#planning--issue-dag)
 - [Execution Engine & Architectural Patterns](#execution-engine--architectural-patterns)
+- [Harness Profiles and Provider Boundary](#harness-profiles-and-provider-boundary)
 - [AgentField Governance: DID & Verifiable Credentials](#agentfield-governance-did--verifiable-credentials)
 - [Agent Catalog](#agent-catalog)
 
@@ -315,6 +316,27 @@ The Sprint Planner's `risk_rationale` field documents *why* each routing decisio
 The memory is injected into every coding iteration as additional context. Conventions discovered in issue 1 propagate to issues 5, 10, 15. A failure pattern encountered in level 1 warns coders in level 3 to avoid the same trap. Interface exports from completed issues give downstream coders concrete import paths rather than guesses.
 
 This is not a vector database or retrieval system — it's a simple key-value store with structured schemas, updated synchronously at known lifecycle points. The simplicity is intentional: memory is only useful if it's reliable, and the schemas ensure that what's written is always parseable by what reads it.
+
+---
+
+## Harness Profiles and Provider Boundary
+
+SWE-AF keeps provider-specific execution behind AgentField's harness boundary. Each direct harness site passes its existing prompt, schema, model, tools, permission mode, and working directory unchanged, plus an opaque profile selected by `profile_for()` when the normalized runtime is `open_code`:
+
+```text
+SWE-AF role → profile_for(role, runtime) → AgentField Agent.harness(profile=...) → provider process
+```
+
+The source-derived registry in [`swe_af/runtime/profiles.py`](../swe_af/runtime/profiles.py) contains semantic role identity and audit metadata only. It has 24 canonical profile IDs for 25 direct call sites; the compatibility replanner and fast execution paths reuse canonical IDs through aliases. The registry does not contain OpenCode JSON, permissions, MCP/command/plugin content, generated paths, credentials, environment values, or model defaults.
+
+| Concern | Owner |
+|---|---|
+| Role-to-profile identity and direct-site coverage | SWE-AF `runtime/profiles.py` |
+| Runtime normalization and existing model selection | SWE-AF `runtime/providers.py` and execution schemas |
+| OpenCode configuration, permissions, isolation, cleanup, and process policy | AgentField provider |
+| Non-OpenCode behavior | Existing profileless Claude Code/Codex paths |
+
+The profile coverage test uses AST inspection to require one explicit registry lookup at every current direct harness site. Registered deterministic roles such as the CI watcher remain non-harness entries and never receive an OpenCode profile. Fast wrappers and `app.call()`/DAG/coding-loop layers continue to delegate through their existing reasoner arguments rather than growing a second profile contract.
 
 ---
 

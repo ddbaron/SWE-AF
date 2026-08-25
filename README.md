@@ -857,6 +857,22 @@ Pass `config` to `build` or `execute`. Full schema: [`swe_af/execution/schemas.p
 
 </details>
 
+### OpenCode profile-managed execution
+
+Profile-managed OpenCode runs consume the maintained AgentField Python fork at
+commit `aa0304577017ee25c405db2a7c2b5fd666f7decc` from
+[`ddbaron/agentfield`](https://github.com/ddbaron/agentfield/tree/aa0304577017ee25c405db2a7c2b5fd666f7decc).
+SWE-AF sends only the opaque role identity from
+[`swe_af/runtime/profiles.py`](swe_af/runtime/profiles.py); AgentField owns
+OpenCode configuration, permissions, isolation, cleanup, and process policy.
+
+The supported capability line begins with OpenCode `1.18.x` fixtures. A
+profile-managed run fails closed when its profile is missing or cannot resolve
+to a primary configured profile; it does not silently run a default or
+subagent. Claude Code and Codex remain profileless and keep their existing
+behavior. Go and TypeScript profile parity is not claimed by this Python-first
+integration.
+
 <details>
 <summary><strong>Model Role Keys</strong></summary>
 

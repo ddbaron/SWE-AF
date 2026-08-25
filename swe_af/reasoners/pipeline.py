@@ -25,6 +25,7 @@ from swe_af.reasoners.schemas import (
     PRD,
     ReviewResult,
 )
+from swe_af.runtime.profiles import profile_for
 from swe_af.runtime.providers import runtime_to_harness_adapter
 from swe_af.surface import internal_role
 
@@ -213,6 +214,7 @@ async def run_product_manager(
             prompt=task_prompt,
             schema=PRD,
             provider=provider,
+            profile=profile_for("swe_af.main.pm", ai_provider),
             model=model,
             max_turns=max_turns,
             tools=["Read", "Write", "Glob", "Grep", "Bash"],
@@ -314,6 +316,7 @@ async def run_environment_scout(
             prompt=task_prompt,
             schema=ScoutResult,
             provider=provider,
+            profile=profile_for("swe_af.main.environment_scout", ai_provider),
             model=model,
             max_turns=max_turns,
             tools=["Read", "Glob", "Grep", "Bash"],
@@ -415,6 +418,7 @@ async def run_architect(
         prompt=task_prompt,
         schema=Architecture,
         provider=provider,
+        profile=profile_for("swe_af.main.architect", ai_provider),
         model=model,
         max_turns=max_turns,
         tools=["Read", "Write", "Glob", "Grep", "Bash"],
@@ -476,6 +480,7 @@ async def run_tech_lead(
         prompt=task_prompt,
         schema=ReviewResult,
         provider=provider,
+        profile=profile_for("swe_af.main.tech_lead", ai_provider),
         model=model,
         max_turns=max_turns,
         tools=["Read", "Write", "Glob", "Grep"],
@@ -559,6 +564,7 @@ async def run_sprint_planner(
         prompt=task_prompt,
         schema=SprintPlanOutput,
         provider=provider,
+        profile=profile_for("swe_af.main.sprint_planner", ai_provider),
         model=model,
         max_turns=max_turns,
         tools=["Read", "Write", "Glob", "Grep"],

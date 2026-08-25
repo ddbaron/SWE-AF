@@ -4,9 +4,11 @@ version = "0.1.0"
 description = "Autonomous SWE agent node for AgentField"
 requires-python = ">=3.12"
 dependencies = [
-    # >=0.1.96 ships ReasonerFailed, which build() raises so an empty build
-    # reports `failed` (not `succeeded`) with its result preserved (#82 Gap 2).
-    "agentfield>=0.1.113",
+    # The fork also includes the ReasonerFailed surface required for failed
+    # builds to preserve their result instead of reporting success.
+    # Profile propagation and the isolated OpenCode provider are consumed from
+    # the maintained fork until that capability is released upstream.
+    "agentfield @ git+https://github.com/ddbaron/agentfield.git@aa0304577017ee25c405db2a7c2b5fd666f7decc#subdirectory=sdk/python",
     "pydantic>=2.0",
     # Compatibility pin: newer SDK builds have surfaced
     # "Unknown message type: rate_limit_event" during streaming.
