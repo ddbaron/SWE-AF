@@ -12,7 +12,7 @@ import os
 from collections import defaultdict, deque
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from swe_af.execution.fatal_error import (
     check_empty_harness_completion,
@@ -154,6 +154,221 @@ def _assign_sequence_numbers(issues: list[dict], levels: list[list[str]]) -> lis
     return list(issue_by_name.values())
 
 
+# Per-stage bounds on the extra schema-bound harness calls a planning role gets
+# when its structured output does not parse or validate. The SDK already retries
+# schema failures inside a single harness() call; these are second, outer bounds
+# that re-issue the whole call with the validation error fed back into the task
+# prompt (issue #146). Keep them small — each attempt is a full stage run over
+# the PRD and architecture, and the architect's architecture object is by far
+# the largest response in the pipeline. The bounds are internal constants, not
+# user-facing knobs: nothing has ever passed a different value.
+PLANNING_ROLE_SCHEMA_RETRIES = 1
+SPRINT_PLANNER_SCHEMA_RETRIES = 2
+
+# Cap on how much of one failed attempt's raw completion is written to the
+# retry log. The first and last halves are kept — output-limit truncation is
+# visible at the tail, malformed-JSON evidence usually at the head — and the
+# middle is elided, so the default three attempts cannot grow the log without
+# bound.
+_MAX_RAW_RESPONSE_CHARS = 200_000
+
+
+def _raw_completion_text(result) -> str:
+    """Best-effort raw completion text from a HarnessResult-like object."""
+    raw = getattr(result, "result", None)
+    if not raw:
+        raw = getattr(result, "text", None)
+    return raw or ""
+
+
+def _describe_schema_failure(result, schema) -> str:
+    """Describe a schema-bound harness call that produced no parsed result.
+
+    Re-validates the raw completion against *schema* when it is available so
+    the message names the parser error or the failing fields. Falls back to the
+    harness's own ``error_message`` (the SDK's terminal schema-failure path
+    carries its diagnosis there) and then to a generic description.
+    """
+    raw = _raw_completion_text(result)
+    detail = (getattr(result, "error_message", "") or "").strip()
+    if raw.strip():
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            parse_error = f"raw response is not valid JSON ({exc})"
+        else:
+            try:
+                schema.model_validate(data)
+            except ValidationError as exc:
+                fields = "; ".join(
+                    f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: "
+                    f"{err['msg']}"
+                    for err in exc.errors()[:10]
+                )
+                parse_error = f"raw response failed schema validation ({fields})"
+            except Exception as exc:  # defensive: surface any validator error
+                parse_error = f"raw response failed schema validation ({exc})"
+            else:
+                parse_error = "the harness returned no parsed result"
+        if detail:
+            return f"{parse_error}; harness reported: {detail}"
+        return parse_error
+    if detail:
+        return detail
+    return "the harness returned no parsed result and no error detail"
+
+
+def _truncate_raw_response(raw: str) -> str:
+    """Keep the head and tail of an oversized raw response."""
+    if len(raw) <= _MAX_RAW_RESPONSE_CHARS:
+        return raw
+    half = _MAX_RAW_RESPONSE_CHARS // 2
+    omitted = len(raw) - _MAX_RAW_RESPONSE_CHARS
+    return (
+        f"{raw[:half]}\n\n"
+        f"# ... {omitted} characters omitted (full response was {len(raw)} chars)"
+        f" ...\n\n{raw[-half:]}"
+    )
+
+
+def _append_artifact(path: str, text: str) -> None:
+    """Append *text* to a run artifact, creating its parent directory."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else f"{text}\n")
+
+
+def _persist_raw_response(
+    path: str, result, *, attempt: int, attempts: int, error: str
+) -> None:
+    """Append one failed attempt's raw completion to the stage's retry log."""
+    raw = _raw_completion_text(result)
+    body = (
+        _truncate_raw_response(raw)
+        if raw.strip()
+        else "(the harness returned no raw completion text)"
+    )
+    _append_artifact(
+        path,
+        f"===== attempt {attempt}/{attempts} failed: {error} =====\n"
+        f"# raw completion text follows\n{body}",
+    )
+
+
+def _record_retry_outcome(path: str, outcome: str) -> None:
+    """Append the terminal retry outcome to the stage's retry log."""
+    _append_artifact(path, f"===== outcome: {outcome} =====")
+
+
+def _record_outcome_best_effort(stage: str, path: str, outcome: str) -> None:
+    """Record a terminal retry outcome without ever failing the stage."""
+    try:
+        _record_retry_outcome(path, outcome)
+    except Exception as exc:  # diagnostics must never mask the real outcome
+        router.note(
+            f"{stage} could not write the retry outcome to {path}: {exc}",
+            tags=["planning", "schema_retry", "artifact_error"],
+        )
+
+
+def _schema_retry_context(error: str) -> str:
+    """Prompt suffix feeding a schema failure back into a retry attempt."""
+    return (
+        "## Retry Context\n"
+        "Your previous response could not be parsed into the required "
+        "structured output. The validation error was:\n\n"
+        f"{error}\n\n"
+        "Produce the complete structured output again, correcting that error. "
+        "Include every required field."
+    )
+
+
+async def _run_planning_call_with_schema_retries(
+    invoke,
+    *,
+    stage: str,
+    failure_label: str,
+    provider: str,
+    model: str,
+    schema,
+    raw_response_path: str,
+    max_schema_retries: int,
+):
+    """Run one schema-bound planning call, retrying parse/validation failures.
+
+    ``invoke`` is an async callable that takes the previous validation error
+    (``None`` on the first attempt) and returns a HarnessResult-like object.
+    Fatal API errors and empty completions fail immediately; only a response
+    that was produced but did not parse/validate is retried, up to
+    *max_schema_retries* extra attempts (callers pass the per-stage
+    ``PLANNING_ROLE_SCHEMA_RETRIES`` / ``SPRINT_PLANNER_SCHEMA_RETRIES``
+    constants). Every failed attempt is appended to *raw_response_path* along
+    with a terminal outcome line, and a failure to write that diagnostic is
+    noted but never replaces the schema failure.
+    """
+    attempts = max(0, max_schema_retries) + 1
+    last_error = ""
+    persistence_error = ""
+    wrote_attempt = False
+    for attempt in range(1, attempts + 1):
+        result = await invoke(last_error or None)
+        check_fatal_harness_error(result)
+        check_empty_harness_completion(
+            result, role=stage, provider=provider, model=model
+        )
+        if result.parsed is not None:
+            # Only log a recovery when this run actually wrote a failed
+            # attempt: a first-attempt success leaves no artifact at all, and
+            # a stale log from an earlier run is never touched.
+            if wrote_attempt:
+                _record_outcome_best_effort(
+                    stage,
+                    raw_response_path,
+                    f"succeeded on attempt {attempt}/{attempts}",
+                )
+            return result
+
+        last_error = _describe_schema_failure(result, schema)
+        try:
+            _persist_raw_response(
+                raw_response_path,
+                result,
+                attempt=attempt,
+                attempts=attempts,
+                error=last_error,
+            )
+            wrote_attempt = True
+        except Exception as exc:  # diagnostics must never mask the real failure
+            persistence_error = str(exc)
+            router.note(
+                f"{stage} could not write the raw response to "
+                f"{raw_response_path}: {exc}",
+                tags=["planning", "schema_retry", "artifact_error"],
+            )
+        if attempt < attempts:
+            router.note(
+                f"{stage} structured output invalid on attempt "
+                f"{attempt}/{attempts} — retrying with the validation error",
+                tags=["planning", "schema_retry"],
+            )
+
+    _record_outcome_best_effort(
+        stage,
+        raw_response_path,
+        f"FAILED after {attempts} attempt(s): {last_error}",
+    )
+    detail = (
+        f"; raw response could not be written: {persistence_error}"
+        if persistence_error
+        else ""
+    )
+    raise RuntimeError(
+        f"{failure_label} after {attempts} attempt(s) "
+        f"(provider={provider}, model={model}; "
+        f"raw response: {raw_response_path}) — {last_error}{detail}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reasoners
 # ---------------------------------------------------------------------------
@@ -209,23 +424,34 @@ async def run_product_manager(
             workspace_manifest=ws_manifest,
             prior_user_responses=prior_user_responses,
         )
-        result = await router.harness(
-            prompt=task_prompt,
-            schema=PRD,
+
+        async def _invoke(previous_error: str | None):
+            prompt = task_prompt
+            if previous_error:
+                prompt = f"{task_prompt}\n\n{_schema_retry_context(previous_error)}"
+            return await router.harness(
+                prompt=prompt,
+                schema=PRD,
+                provider=provider,
+                model=model,
+                max_turns=max_turns,
+                tools=["Read", "Write", "Glob", "Grep", "Bash"],
+                permission_mode=permission_mode or None,
+                system_prompt=system_prompt,
+                cwd=repo_path,
+            )
+
+        result = await _run_planning_call_with_schema_retries(
+            _invoke,
+            stage="PM",
+            failure_label="Product manager failed to produce a valid PRD",
             provider=provider,
             model=model,
-            max_turns=max_turns,
-            tools=["Read", "Write", "Glob", "Grep", "Bash"],
-            permission_mode=permission_mode or None,
-            system_prompt=system_prompt,
-            cwd=repo_path,
-        )
-        check_fatal_harness_error(result)
-        # An empty completion here (no parsed output, no text) is a
-        # provider/model mismatch, not a schema-quality problem — surface it
-        # distinctly with provider+model instead of the generic PRD message.
-        check_empty_harness_completion(
-            result, role="PM", provider=provider, model=model
+            schema=PRD,
+            raw_response_path=os.path.join(
+                base, "plan", "product_manager_raw_response.txt"
+            ),
+            max_schema_retries=PLANNING_ROLE_SCHEMA_RETRIES,
         )
         return result.parsed
 
@@ -241,9 +467,9 @@ async def run_product_manager(
     )
 
     if parsed is None:
-        # Reached only when the harness produced non-empty but unparseable
-        # output (empty completions are raised distinctly above). Name the
-        # provider+model so the failure is diagnosable.
+        # Defensive: _invoke_pm raises through the retry helper on schema
+        # failures, so this is only reachable if the ask-user wrapper returns
+        # no result. Name the provider+model so the failure is diagnosable.
         raise RuntimeError(
             f"Product manager failed to produce a valid PRD "
             f"(provider={provider}, model={model})"
@@ -411,26 +637,33 @@ async def run_architect(
         workspace_manifest=ws_manifest,
     )
     provider = runtime_to_harness_adapter(ai_provider)
-    result = await router.harness(
-        prompt=task_prompt,
-        schema=Architecture,
+
+    async def _invoke(previous_error: str | None):
+        prompt = task_prompt
+        if previous_error:
+            prompt = f"{task_prompt}\n\n{_schema_retry_context(previous_error)}"
+        return await router.harness(
+            prompt=prompt,
+            schema=Architecture,
+            provider=provider,
+            model=model,
+            max_turns=max_turns,
+            tools=["Read", "Write", "Glob", "Grep", "Bash"],
+            permission_mode=permission_mode or None,
+            system_prompt=system_prompt,
+            cwd=repo_path,
+        )
+
+    result = await _run_planning_call_with_schema_retries(
+        _invoke,
+        stage="Architect",
+        failure_label="Architect failed to produce a valid architecture",
         provider=provider,
         model=model,
-        max_turns=max_turns,
-        tools=["Read", "Write", "Glob", "Grep", "Bash"],
-        permission_mode=permission_mode or None,
-        system_prompt=system_prompt,
-        cwd=repo_path,
+        schema=Architecture,
+        raw_response_path=os.path.join(base, "plan", "architect_raw_response.txt"),
+        max_schema_retries=PLANNING_ROLE_SCHEMA_RETRIES,
     )
-    check_fatal_harness_error(result)
-    check_empty_harness_completion(
-        result, role="Architect", provider=provider, model=model
-    )
-    if result.parsed is None:
-        raise RuntimeError(
-            f"Architect failed to produce a valid architecture "
-            f"(provider={provider}, model={model})"
-        )
 
     router.note("Architect complete", tags=["architect", "complete"])
     return result.parsed.model_dump()
@@ -472,26 +705,33 @@ async def run_tech_lead(
         workspace_manifest=ws_manifest,
     )
     provider = runtime_to_harness_adapter(ai_provider)
-    result = await router.harness(
-        prompt=task_prompt,
-        schema=ReviewResult,
+
+    async def _invoke(previous_error: str | None):
+        prompt = task_prompt
+        if previous_error:
+            prompt = f"{task_prompt}\n\n{_schema_retry_context(previous_error)}"
+        return await router.harness(
+            prompt=prompt,
+            schema=ReviewResult,
+            provider=provider,
+            model=model,
+            max_turns=max_turns,
+            tools=["Read", "Write", "Glob", "Grep"],
+            permission_mode=permission_mode or None,
+            system_prompt=system_prompt,
+            cwd=repo_path,
+        )
+
+    result = await _run_planning_call_with_schema_retries(
+        _invoke,
+        stage="Tech lead",
+        failure_label="Tech lead failed to produce a valid review",
         provider=provider,
         model=model,
-        max_turns=max_turns,
-        tools=["Read", "Write", "Glob", "Grep"],
-        permission_mode=permission_mode or None,
-        system_prompt=system_prompt,
-        cwd=repo_path,
+        schema=ReviewResult,
+        raw_response_path=os.path.join(base, "plan", "tech_lead_raw_response.txt"),
+        max_schema_retries=PLANNING_ROLE_SCHEMA_RETRIES,
     )
-    check_fatal_harness_error(result)
-    check_empty_harness_completion(
-        result, role="Tech lead", provider=provider, model=model
-    )
-    if result.parsed is None:
-        raise RuntimeError(
-            f"Tech lead failed to produce a valid review "
-            f"(provider={provider}, model={model})"
-        )
 
     review = result.parsed.model_dump()
     review_json_path = os.path.join(base, "plan", "review.json")
@@ -517,6 +757,11 @@ async def run_sprint_planner(
     """Run the sprint planner to decompose work into executable issues.
 
     Returns a dict with ``issues`` (list of issue dicts) and ``rationale`` (str).
+
+    A response that does not parse/validate is retried up to
+    ``SPRINT_PLANNER_SCHEMA_RETRIES`` times, each retry feeding the validation
+    error back into the task prompt. Every failed attempt and the terminal
+    outcome are appended to ``plan/sprint_planner_raw_response.txt``.
     """
     router.note("Sprint Planner starting", tags=["sprint_planner", "start"])
 
@@ -555,26 +800,33 @@ async def run_sprint_planner(
         architecture_path=paths["architecture"],
     )
     provider = runtime_to_harness_adapter(ai_provider)
-    result = await router.harness(
-        prompt=task_prompt,
-        schema=SprintPlanOutput,
+
+    async def _invoke(previous_error: str | None):
+        prompt = task_prompt
+        if previous_error:
+            prompt = f"{task_prompt}\n\n{_schema_retry_context(previous_error)}"
+        return await router.harness(
+            prompt=prompt,
+            schema=SprintPlanOutput,
+            provider=provider,
+            model=model,
+            max_turns=max_turns,
+            tools=["Read", "Write", "Glob", "Grep"],
+            permission_mode=permission_mode or None,
+            system_prompt=system_prompt,
+            cwd=repo_path,
+        )
+
+    result = await _run_planning_call_with_schema_retries(
+        _invoke,
+        stage="Sprint planner",
+        failure_label="Sprint planner failed to produce valid issues",
         provider=provider,
         model=model,
-        max_turns=max_turns,
-        tools=["Read", "Write", "Glob", "Grep"],
-        permission_mode=permission_mode or None,
-        system_prompt=system_prompt,
-        cwd=repo_path,
+        schema=SprintPlanOutput,
+        raw_response_path=os.path.join(base, "plan", "sprint_planner_raw_response.txt"),
+        max_schema_retries=SPRINT_PLANNER_SCHEMA_RETRIES,
     )
-    check_fatal_harness_error(result)
-    check_empty_harness_completion(
-        result, role="Sprint planner", provider=provider, model=model
-    )
-    if result.parsed is None:
-        raise RuntimeError(
-            f"Sprint planner failed to produce valid issues "
-            f"(provider={provider}, model={model})"
-        )
 
     router.note("Sprint Planner complete", tags=["sprint_planner", "complete"])
     return {

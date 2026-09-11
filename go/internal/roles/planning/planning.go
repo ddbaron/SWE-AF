@@ -24,8 +24,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/Agent-Field/agentfield/sdk/go/agent"
+	"github.com/Agent-Field/agentfield/sdk/go/harness"
 
 	"github.com/Agent-Field/SWE-AF/go/internal/config"
 	"github.com/Agent-Field/SWE-AF/go/internal/dagutil"
@@ -91,7 +93,7 @@ func RunProductManager(ctx context.Context, deps *Deps, input map[string]any) (a
 	aiProvider := orResolvedDefault(getString(input, "ai_provider", ""), config.DefaultRuntime())
 	initialPrior := getPriorResponses(input)
 
-	_, paths, err := ensurePaths(repoPath, artifactsDir)
+	base, paths, err := ensurePaths(repoPath, artifactsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -133,14 +135,16 @@ func RunProductManager(ctx context.Context, deps *Deps, input map[string]any) (a
 			SystemPrompt:   systemPrompt,
 			Cwd:            repoPath,
 		}.ToOptions()
-		parsed, res, err := harnessx.Run[schemas.PRD](ctx, deps.Harness, taskPrompt, opts)
+		parsed, err := runSchemaBoundRole[schemas.PRD](
+			ctx, deps, opts, taskPrompt,
+			filepath.Join(base, "plan", "product_manager_raw_response.txt"),
+			"PM",
+			"Product manager failed to produce a valid PRD",
+			provider, model,
+			planningRoleSchemaRetries,
+		)
 		if err != nil {
 			return nil, err
-		}
-		if res == nil || res.Parsed == nil {
-			// Parse failure: Python's _invoke_pm returns None. Signal that to
-			// the wrapper with a nil map (run_with_ask_user then returns nil).
-			return nil, nil
 		}
 		return toMap(parsed)
 	}
@@ -307,7 +311,7 @@ func RunArchitect(ctx context.Context, deps *Deps, input map[string]any) (any, e
 	permissionMode := getString(input, "permission_mode", "")
 	aiProvider := orResolvedDefault(getString(input, "ai_provider", ""), config.DefaultRuntime())
 
-	_, paths, err := ensurePaths(repoPath, artifactsDir)
+	base, paths, err := ensurePaths(repoPath, artifactsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -350,12 +354,16 @@ func RunArchitect(ctx context.Context, deps *Deps, input map[string]any) (any, e
 		SystemPrompt:   systemPrompt,
 		Cwd:            repoPath,
 	}.ToOptions()
-	parsed, res, err := harnessx.Run[schemas.Architecture](ctx, deps.Harness, taskPrompt, opts)
+	parsed, err := runSchemaBoundRole[schemas.Architecture](
+		ctx, deps, opts, taskPrompt,
+		filepath.Join(base, "plan", "architect_raw_response.txt"),
+		"Architect",
+		"Architect failed to produce a valid architecture",
+		provider, model,
+		planningRoleSchemaRetries,
+	)
 	if err != nil {
 		return nil, err
-	}
-	if res == nil || res.Parsed == nil {
-		return nil, errors.New("Architect failed to produce a valid architecture")
 	}
 
 	deps.App.Note(ctx, "Architect complete", "architect", "complete")
@@ -414,12 +422,16 @@ func RunTechLead(ctx context.Context, deps *Deps, input map[string]any) (any, er
 		SystemPrompt:   systemPrompt,
 		Cwd:            repoPath,
 	}.ToOptions()
-	parsed, res, err := harnessx.Run[schemas.ReviewResult](ctx, deps.Harness, taskPrompt, opts)
+	parsed, err := runSchemaBoundRole[schemas.ReviewResult](
+		ctx, deps, opts, taskPrompt,
+		filepath.Join(base, "plan", "tech_lead_raw_response.txt"),
+		"Tech lead",
+		"Tech lead failed to produce a valid review",
+		provider, model,
+		planningRoleSchemaRetries,
+	)
 	if err != nil {
 		return nil, err
-	}
-	if res == nil || res.Parsed == nil {
-		return nil, errors.New("Tech lead failed to produce a valid review")
 	}
 
 	review, err := toMap(parsed)
@@ -450,11 +462,242 @@ type sprintPlanOutput struct {
 	Rationale string                 `json:"rationale"`
 }
 
+// planningRoleSchemaRetries is the number of extra schema-bound harness calls
+// the product manager, architect and tech lead get when their structured output
+// does not parse/validate. Kept small on purpose: each attempt is a full stage
+// run over the PRD and architecture.
+const planningRoleSchemaRetries = 1
+
+// sprintPlannerSchemaRetries is the extra-call bound for the sprint planner.
+// Its response is a large issue set that feeds every downstream issue, and the
+// SDK already retries schema failures inside a single harness() call, so one
+// extra attempt than the other stages is enough. Mirrors Python's
+// PLANNING_ROLE_SCHEMA_RETRIES / SPRINT_PLANNER_SCHEMA_RETRIES
+// (swe_af/reasoners/pipeline.py, #146). These are internal constants rather
+// than handler inputs because nothing passes a different value.
+const sprintPlannerSchemaRetries = 2
+
+// maxRawResponseChars caps one failed attempt's raw text in the retry log. The
+// first and last halves are kept — output-limit truncation shows at the tail,
+// malformed-JSON evidence usually at the head — and the middle is elided, so
+// the default three attempts cannot grow the log without bound.
+const maxRawResponseChars = 200_000
+
+// schemaRetryContext feeds a failed attempt's parse/validation error back into
+// the retry prompt. Mirrors pipeline._schema_retry_context.
+const schemaRetryContext = "## Retry Context\n" +
+	"Your previous response could not be parsed into the required " +
+	"structured output. The validation error was:\n\n%s\n\n" +
+	"Produce the complete structured output again, correcting that error. " +
+	"Include every required field."
+
+// isEmptyCompletion reports whether a schema-bound harness call returned with
+// neither a parsed object nor any raw text. Python's
+// check_empty_harness_completion classifies that shape as a provider/model
+// mismatch rather than a schema-quality failure, so it must fail fast instead
+// of burning the retry bound. A terminal failure_type=schema is exempt: the
+// agent did produce output that failed validation, the raw text just was not
+// surfaced on the result.
+func isEmptyCompletion(result *harness.Result) bool {
+	if result == nil {
+		return true
+	}
+	if result.Parsed != nil {
+		return false
+	}
+	if strings.TrimSpace(result.Result) != "" {
+		return false
+	}
+	return result.FailureType != harness.FailureSchema
+}
+
+// describeSchemaFailure names the parser error or the failing fields for a
+// schema-bound call that produced no parsed result. Re-decoding the raw text
+// into dst makes the decode error name the offending field; the harness's own
+// ErrorMessage is appended when present. encoding/json only reports decode and
+// type errors — it does not enforce required fields — so for a structurally
+// valid response that is missing a field this leans on the harness's own
+// message. Mirrors pipeline._describe_schema_failure.
+func describeSchemaFailure(result *harness.Result, dst any) string {
+	raw := ""
+	detail := ""
+	if result != nil {
+		raw = result.Result
+		detail = strings.TrimSpace(result.ErrorMessage)
+	}
+	if strings.TrimSpace(raw) == "" {
+		if detail != "" {
+			return detail
+		}
+		return "the harness returned no parsed result and no error detail"
+	}
+	failure := "the harness returned no parsed result"
+	if err := json.Unmarshal([]byte(raw), dst); err != nil {
+		failure = fmt.Sprintf("raw response failed schema validation (%v)", err)
+	}
+	if detail != "" {
+		return fmt.Sprintf("%s; harness reported: %s", failure, detail)
+	}
+	return failure
+}
+
+// truncateRawResponse keeps the head and tail of an oversized raw response.
+func truncateRawResponse(raw string) string {
+	if len(raw) <= maxRawResponseChars {
+		return raw
+	}
+	half := maxRawResponseChars / 2
+	omitted := len(raw) - maxRawResponseChars
+	return raw[:half] + fmt.Sprintf(
+		"\n\n# ... %d characters omitted (full response was %d chars) ...\n\n",
+		omitted, len(raw),
+	) + raw[len(raw)-half:]
+}
+
+// appendArtifact appends text to a run artifact, creating its parent directory.
+func appendArtifact(path, text string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	if !strings.HasSuffix(text, "\n") {
+		text += "\n"
+	}
+	if _, err := f.WriteString(text); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// persistRawResponse appends one failed attempt's raw completion to the
+// stage's retry log. Mirrors pipeline._persist_raw_response.
+func persistRawResponse(path string, result *harness.Result, attempt, attempts int, failure string) error {
+	raw := ""
+	if result != nil {
+		raw = result.Result
+	}
+	body := strings.TrimSpace(raw)
+	if body != "" {
+		body = truncateRawResponse(raw)
+	} else {
+		body = "(the harness returned no raw completion text)"
+	}
+	return appendArtifact(path, fmt.Sprintf(
+		"===== attempt %d/%d failed: %s =====\n# raw completion text follows\n%s",
+		attempt, attempts, failure, body,
+	))
+}
+
+// recordRetryOutcome appends the terminal retry outcome to the stage's retry
+// log.
+func recordRetryOutcome(path, outcome string) error {
+	return appendArtifact(path, "===== outcome: "+outcome+" =====")
+}
+
+// recordOutcomeBestEffort records a terminal retry outcome without ever failing
+// the stage.
+func recordOutcomeBestEffort(ctx context.Context, deps *Deps, stage, path, outcome string) {
+	if err := recordRetryOutcome(path, outcome); err != nil {
+		deps.App.Note(ctx, fmt.Sprintf(
+			"%s could not write the retry outcome to %s: %v",
+			stage, path, err), "planning", "schema_retry", "artifact_error")
+	}
+}
+
+// runSchemaBoundRole drives the bounded schema-retry loop shared by the four
+// planning stages (PM, architect, tech lead, sprint planner). It re-issues the
+// harness call with the validation error fed back into the prompt when the
+// output does not parse/validate, appends every failed attempt and the terminal
+// outcome to rawResponsePath, and never lets a diagnostic write mask the real
+// failure. maxSchemaRetries is set per call site from
+// planningRoleSchemaRetries / sprintPlannerSchemaRetries.
+func runSchemaBoundRole[T any](
+	ctx context.Context,
+	deps *Deps,
+	opts harness.Options,
+	taskPrompt string,
+	rawResponsePath string,
+	stage string,
+	failureLabel string,
+	provider string,
+	model string,
+	maxSchemaRetries int,
+) (*T, error) {
+	attempts := maxSchemaRetries + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	lastFailure := ""
+	persistenceError := ""
+	wroteAttempt := false
+	for attempt := 1; attempt <= attempts; attempt++ {
+		prompt := taskPrompt
+		if lastFailure != "" {
+			prompt += "\n\n" + fmt.Sprintf(schemaRetryContext, lastFailure)
+		}
+		parsed, res, err := harnessx.Run[T](ctx, deps.Harness, prompt, opts)
+		if err != nil {
+			return nil, err
+		}
+		if res != nil && res.Parsed != nil {
+			// Only log a recovery when this run actually wrote a failed
+			// attempt: a first-attempt success leaves no artifact at all, and
+			// a stale log from an earlier run is never touched.
+			if wroteAttempt {
+				recordOutcomeBestEffort(ctx, deps, stage, rawResponsePath,
+					fmt.Sprintf("succeeded on attempt %d/%d", attempt, attempts))
+			}
+			return parsed, nil
+		}
+		if isEmptyCompletion(res) {
+			return nil, fmt.Errorf(
+				"%s harness returned an empty completion "+
+					"(provider=%s, model=%s) — check provider auth/model compatibility",
+				stage, provider, model,
+			)
+		}
+		var zero T
+		lastFailure = describeSchemaFailure(res, &zero)
+		if err := persistRawResponse(rawResponsePath, res, attempt, attempts, lastFailure); err != nil {
+			persistenceError = err.Error()
+			deps.App.Note(ctx, fmt.Sprintf(
+				"%s could not write the raw response to %s: %v",
+				stage, rawResponsePath, err), "planning", "schema_retry", "artifact_error")
+		} else {
+			wroteAttempt = true
+		}
+		if attempt < attempts {
+			deps.App.Note(ctx, fmt.Sprintf(
+				"%s structured output invalid on attempt %d/%d — retrying with the validation error",
+				stage, attempt, attempts), "planning", "schema_retry")
+		}
+	}
+	recordOutcomeBestEffort(ctx, deps, stage, rawResponsePath,
+		fmt.Sprintf("FAILED after %d attempt(s): %s", attempts, lastFailure))
+	persistenceDetail := ""
+	if persistenceError != "" {
+		persistenceDetail = "; raw response could not be written: " + persistenceError
+	}
+	return nil, fmt.Errorf(
+		"%s after %d attempt(s) (provider=%s, model=%s; raw response: %s) — %s%s",
+		failureLabel, attempts, provider, model, rawResponsePath, lastFailure, persistenceDetail,
+	)
+}
+
 // RunSprintPlanner decomposes the work into executable issues. Ports
 // pipeline.py:477-549. Returns {"issues": [...], "rationale": "..."}. The pure
 // level/conflict/sequence helpers (_compute_levels, _validate_file_conflicts,
 // _assign_sequence_numbers) are applied by the plan orchestrator, NOT here — the
 // reasoner only surfaces the raw issues + rationale.
+//
+// A response that does not parse/validate is retried up to
+// sprintPlannerSchemaRetries times, each retry feeding the validation error
+// back into the task prompt. Every failed attempt and the terminal outcome are
+// appended to plan/sprint_planner_raw_response.txt.
 func RunSprintPlanner(ctx context.Context, deps *Deps, input map[string]any) (any, error) {
 	deps.App.Note(ctx, "Sprint Planner starting", "sprint_planner", "start")
 
@@ -465,7 +708,7 @@ func RunSprintPlanner(ctx context.Context, deps *Deps, input map[string]any) (an
 	permissionMode := getString(input, "permission_mode", "")
 	aiProvider := orResolvedDefault(getString(input, "ai_provider", ""), config.DefaultRuntime())
 
-	_, paths, err := ensurePaths(repoPath, artifactsDir)
+	base, paths, err := ensurePaths(repoPath, artifactsDir)
 	if err != nil {
 		return nil, err
 	}
@@ -522,14 +765,17 @@ func RunSprintPlanner(ctx context.Context, deps *Deps, input map[string]any) (an
 		SystemPrompt:   systemPrompt,
 		Cwd:            repoPath,
 	}.ToOptions()
-	parsed, res, err := harnessx.Run[sprintPlanOutput](ctx, deps.Harness, taskPrompt, opts)
+	parsed, err := runSchemaBoundRole[sprintPlanOutput](
+		ctx, deps, opts, taskPrompt,
+		filepath.Join(base, "plan", "sprint_planner_raw_response.txt"),
+		"Sprint planner",
+		"Sprint planner failed to produce valid issues",
+		provider, model,
+		sprintPlannerSchemaRetries,
+	)
 	if err != nil {
 		return nil, err
 	}
-	if res == nil || res.Parsed == nil {
-		return nil, errors.New("Sprint planner failed to produce valid issues")
-	}
-
 	issues := make([]any, 0, len(parsed.Issues))
 	for i := range parsed.Issues {
 		m, err := toMap(&parsed.Issues[i])
